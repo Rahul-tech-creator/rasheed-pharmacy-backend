@@ -40,13 +40,30 @@ app.use('/api/medicines', medicinesRouter);
 app.use('/api/prescriptions', authenticate, prescriptionsRouter);
 app.use('/api/slots', authenticate, slotsRouter);
 
+// Root route
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: 'Rasheed Pharmacy API',
+    version: '1.0.0',
+    docs: 'https://github.com/thotarahul2006-1061/rasheed-pharmacy-backend',
+    endpoints: {
+      auth: '/api/auth',
+      medicines: '/api/medicines',
+      prescriptions: '/api/prescriptions',
+      slots: '/api/slots',
+      health: '/api/health'
+    }
+  });
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ success: true, status: 'Rasheed Pharmacy API is running', timestamp: new Date().toISOString() });
 });
 
-// 404 handler
-app.use('/api/{*splat}', (req, res) => {
+// 404 handler - catch all
+app.use((req, res) => {
   res.status(404).json({ success: false, error: 'API endpoint not found' });
 });
 
