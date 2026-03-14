@@ -41,7 +41,7 @@ const otpLimiter = rateLimit({
  * POST /api/auth/send-otp
  * Body: { phone: string, name?: string }
  */
-router.post('/send-otp', otpLimiter, (req, res, next) => {
+router.post('/send-otp', otpLimiter, async (req, res, next) => {
   try {
     let { phone, name } = req.body;
 
@@ -49,32 +49,43 @@ router.post('/send-otp', otpLimiter, (req, res, next) => {
       return res.status(400).json({ success: false, error: 'Phone number is required.' });
     }
 
-    // Normalize phone — keep only digits
+    // Normalize phone — keep only digits (e.g. 9052277644)
     phone = phone.replace(/\D/g, '');
     if (phone.length < 10 || phone.length > 15) {
       return res.status(400).json({ success: false, error: 'Invalid phone number. Must be 10-15 digits.' });
     }
 
-    // Clean up expired OTPs for this phone
-    db.prepare("DELETE FROM otp_codes WHERE phone = ? OR expires_at < datetime('now')").run(phone);
+    // Prepend 91 if it's a 10-digit Indian number for 2Factor
+    const fullPhone = phone.length === 10 ? `91${phone}` : phone;
 
-    // Generate OTP
-    const otp = generateOtp();
-    const otpHash = hashValue(otp);
+    // Clean up expired OTPs for this phone
+    await db.query("DELETE FROM otp_requests WHERE phone_number = $1 OR expires_at < NOW()", [phone]);
+
+    // Call 2Factor AUTOGEN API
+    const apiKey = process.env.SMS_API_KEY;
+    if (!apiKey) {
+      throw new Error('SMS API key is not configured.');
+    }
+    
+    // Use the full normalized phone (e.g. 919052277644)
+    const authUrl = `https://2factor.in/API/V1/${apiKey}/SMS/${fullPhone}/AUTOGEN`;
+    console.log(`📡 Sending OTP via 2Factor: ${authUrl.replace(apiKey, 'HIDDEN')}`);
+    const response = await fetch(authUrl);
+    const data = await response.json();
+    
+    if (data.Status !== 'Success') {
+      console.error('2Factor API Error:', data);
+      return res.status(500).json({ success: false, error: 'Failed to send OTP SMS.' });
+    }
+    
+    const sessionId = data.Details;
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
 
-    db.prepare('INSERT INTO otp_codes (phone, code_hash, expires_at) VALUES (?, ?, ?)').run(phone, otpHash, expiresAt);
+    await db.query('INSERT INTO otp_requests (phone_number, otp_code, expires_at) VALUES ($1, $2, $3)', [phone, sessionId, expiresAt]);
 
-    // In production, send OTP via SMS gateway here
-    console.log(`📱 OTP for ${phone}: ${otp}`);
-
-    // Dev mode — return OTP in response for testing
     res.json({
       success: true,
-      message: 'OTP sent successfully.',
-      // DEV ONLY — remove in production
-      dev_otp: otp,
-      phone,
+      message: 'OTP sent successfully.'
     });
   } catch (err) {
     next(err);
@@ -85,7 +96,7 @@ router.post('/send-otp', otpLimiter, (req, res, next) => {
  * POST /api/auth/verify-otp
  * Body: { phone: string, otp: string, name?: string }
  */
-router.post('/verify-otp', (req, res, next) => {
+router.post('/verify-otp', async (req, res, next) => {
   try {
     let { phone, otp, name } = req.body;
 
@@ -94,27 +105,41 @@ router.post('/verify-otp', (req, res, next) => {
     }
 
     phone = phone.replace(/\D/g, '');
-    const otpHash = hashValue(otp);
-
-    // Find valid OTP
-    const otpRecord = db.prepare(
-      "SELECT * FROM otp_codes WHERE phone = ? AND code_hash = ? AND used = 0 AND expires_at > datetime('now') ORDER BY created_at DESC LIMIT 1"
-    ).get(phone, otpHash);
+    // Find valid OTP request session
+    const otpRes = await db.query(
+      "SELECT * FROM otp_requests WHERE phone_number = $1 AND status != 'verified' AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1",
+      [phone]
+    );
+    const otpRecord = otpRes.rows[0];
 
     if (!otpRecord) {
-      return res.status(400).json({ success: false, error: 'Invalid or expired OTP. Please request a new one.' });
+      return res.status(400).json({ success: false, error: 'OTP request not found or expired. Please request a new one.' });
     }
 
-    // Mark OTP as used
-    db.prepare('UPDATE otp_codes SET used = 1 WHERE id = ?').run(otpRecord.id);
+    const sessionId = otpRecord.otp_code;
+    const apiKey = process.env.SMS_API_KEY;
+
+    // Call 2Factor VERIFY API
+    const verifyUrl = `https://2factor.in/API/V1/${apiKey}/SMS/VERIFY/${sessionId}/${otp}`;
+    const response = await fetch(verifyUrl);
+    const data = await response.json();
+
+    if (data.Status !== 'Success') {
+      return res.status(400).json({ success: false, error: 'Invalid OTP. Please try again.' });
+    }
+
+    // Mark OTP as verified
+    await db.query("UPDATE otp_requests SET status = 'verified' WHERE id = $1", [otpRecord.id]);
 
     // Find or create user
-    let user = db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
+    let userRes = await db.query('SELECT * FROM users WHERE phone_number = $1', [phone]);
+    let user = userRes.rows[0];
     if (!user) {
-      db.prepare('INSERT INTO users (phone, name, role) VALUES (?, ?, ?)').run(phone, name || '', 'customer');
-      user = db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
+      await db.query('INSERT INTO users (phone_number, name, role) VALUES ($1, $2, $3)', [phone, name || '', 'customer']);
+      userRes = await db.query('SELECT * FROM users WHERE phone_number = $1', [phone]);
+      user = userRes.rows[0];
     } else if (name && !user.name) {
-      db.prepare('UPDATE users SET name = ? WHERE id = ?').run(name, user.id);
+      await db.query('UPDATE users SET name = $1 WHERE id = $2', [name, user.id]);
       user.name = name;
     }
 
@@ -125,13 +150,13 @@ router.post('/verify-otp', (req, res, next) => {
     // Store refresh token
     const refreshHash = hashValue(refreshToken);
     const refreshExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
-    db.prepare('INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)').run(user.id, refreshHash, refreshExpiry);
+    await db.query('INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)', [user.id, refreshHash, refreshExpiry]);
 
     res.json({
       success: true,
       message: 'Login successful.',
       data: {
-        user: { id: user.id, phone: user.phone, name: user.name, role: user.role },
+        user: { id: user.id, phone: user.phone_number, name: user.name, role: user.role },
         accessToken,
         refreshToken,
       },
@@ -145,7 +170,7 @@ router.post('/verify-otp', (req, res, next) => {
  * POST /api/auth/refresh
  * Body: { refreshToken: string }
  */
-router.post('/refresh', (req, res, next) => {
+router.post('/refresh', async (req, res, next) => {
   try {
     const { refreshToken } = req.body;
     if (!refreshToken) {
@@ -162,16 +187,19 @@ router.post('/refresh', (req, res, next) => {
 
     // Check if token exists in DB
     const tokenHash = hashValue(refreshToken);
-    const storedToken = db.prepare(
-      "SELECT * FROM refresh_tokens WHERE user_id = ? AND token_hash = ? AND expires_at > datetime('now')"
-    ).get(decoded.userId, tokenHash);
+    const storedRes = await db.query(
+      "SELECT * FROM refresh_tokens WHERE user_id = $1 AND token_hash = $2 AND expires_at > NOW()",
+      [decoded.userId, tokenHash]
+    );
+    const storedToken = storedRes.rows[0];
 
     if (!storedToken) {
       return res.status(401).json({ success: false, error: 'Refresh token revoked or expired.' });
     }
 
     // Issue new access token
-    const user = db.prepare('SELECT id, phone, name, role FROM users WHERE id = ?').get(decoded.userId);
+    const userRes = await db.query('SELECT id, phone_number, name, role FROM users WHERE id = $1', [decoded.userId]);
+    const user = userRes.rows[0];
     if (!user) {
       return res.status(401).json({ success: false, error: 'User not found.' });
     }
@@ -194,12 +222,12 @@ router.post('/refresh', (req, res, next) => {
  * POST /api/auth/logout
  * Body: { refreshToken: string }
  */
-router.post('/logout', (req, res, next) => {
+router.post('/logout', async (req, res, next) => {
   try {
     const { refreshToken } = req.body;
     if (refreshToken) {
       const tokenHash = hashValue(refreshToken);
-      db.prepare('DELETE FROM refresh_tokens WHERE token_hash = ?').run(tokenHash);
+      await db.query('DELETE FROM refresh_tokens WHERE token_hash = $1', [tokenHash]);
     }
     res.json({ success: true, message: 'Logged out successfully.' });
   } catch (err) {

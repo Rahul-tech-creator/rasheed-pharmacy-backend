@@ -4,8 +4,13 @@ import { body, param, query, validationResult } from 'express-validator';
 export const handleValidation = (req, res, next) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
+    console.log('❌ Validation Failures:', JSON.stringify(errors.array(), null, 2));
+    console.log('   Params:', req.params);
+    console.log('   Body:', req.body);
     return res.status(400).json({
       success: false,
+      message: 'Validation failed',
+      error: errors.array()[0].msg, // Direct error string for easier frontend notification
       errors: errors.array().map(e => ({ field: e.path, message: e.msg }))
     });
   }
@@ -33,7 +38,7 @@ export const validateMedicine = [
 ];
 
 export const validateMedicineUpdate = [
-  param('id').isInt({ min: 1 }).withMessage('Invalid medicine ID'),
+  param('id').isUUID().withMessage('Invalid medicine ID'),
   body('name')
     .optional()
     .trim()
@@ -56,7 +61,7 @@ export const validateMedicineUpdate = [
 ];
 
 export const validateSell = [
-  param('id').isInt({ min: 1 }).withMessage('Invalid medicine ID'),
+  param('id').isUUID().withMessage('Invalid medicine ID'),
   body('quantity')
     .optional()
     .isInt({ min: 1 }).withMessage('Quantity must be at least 1'),
@@ -81,7 +86,7 @@ export const validatePrescription = [
 ];
 
 export const validateStatusUpdate = [
-  param('id').isInt({ min: 1 }).withMessage('Invalid prescription ID'),
+  param('id').isUUID().withMessage('Invalid prescription ID'),
   body('status')
     .notEmpty().withMessage('Status is required')
     .isIn(['Received', 'Checking Medicines', 'Preparing Order', 'Ready for Pickup', 'Completed']).withMessage('Status must be a valid pipeline value'),
@@ -109,7 +114,7 @@ export const validateSlot = [
     .matches(/^\d{2}:\d{2}$/).withMessage('Time must be in HH:MM format'),
   body('prescription_id')
     .optional({ values: 'null' })
-    .isInt({ min: 1 }).withMessage('Invalid prescription ID'),
+    .isUUID().withMessage('Invalid prescription ID'),
   body('notes')
     .optional()
     .trim()

@@ -10,7 +10,7 @@ export { JWT_SECRET, JWT_REFRESH_SECRET };
  * Authenticate — verifies JWT from Authorization header.
  * Attaches req.user = { id, phone, name, role }
  */
-export const authenticate = (req, res, next) => {
+export const authenticate = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return res.status(401).json({ success: false, error: 'Authentication required. Please log in.' });
@@ -19,7 +19,8 @@ export const authenticate = (req, res, next) => {
   const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT id, phone, name, role FROM users WHERE id = ?').get(decoded.userId);
+    const result = await db.query('SELECT id, phone_number, name, role FROM users WHERE id = $1', [decoded.userId]);
+    const user = result.rows[0];
     if (!user) {
       return res.status(401).json({ success: false, error: 'User not found. Please log in again.' });
     }
@@ -36,7 +37,7 @@ export const authenticate = (req, res, next) => {
 /**
  * Optional authenticate — same as authenticate but doesn't fail if no token
  */
-export const optionalAuth = (req, res, next) => {
+export const optionalAuth = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     req.user = null;
@@ -46,8 +47,8 @@ export const optionalAuth = (req, res, next) => {
   const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT id, phone, name, role FROM users WHERE id = ?').get(decoded.userId);
-    req.user = user || null;
+    const result = await db.query('SELECT id, phone_number, name, role FROM users WHERE id = $1', [decoded.userId]);
+    req.user = result.rows[0] || null;
   } catch {
     req.user = null;
   }

@@ -39,7 +39,7 @@ const upload = multer({
 });
 
 // POST /api/prescriptions — upload new prescription or create medicine order
-router.post('/', upload.single('prescription_file'), validatePrescription, (req, res, next) => {
+router.post('/', upload.single('prescription_file'), validatePrescription, async (req, res, next) => {
   try {
     const { customer_name, customer_phone, notes, items } = req.body;
     const userId = req.user?.id || null;
@@ -55,11 +55,15 @@ router.post('/', upload.single('prescription_file'), validatePrescription, (req,
       }
     }
 
-    let result;
-    const createOrder = db.transaction(() => {
+    const client = await db.connect();
+    let prescriptionId;
+    try {
+      await client.query('BEGIN');
+      
       // 1. Verify stock for all items
       for (const item of parsedItems) {
-        const med = db.prepare('SELECT id, name, price, stock FROM medicines WHERE id = ?').get(item.medicine_id);
+        const medRes = await client.query('SELECT id, name, price, stock FROM medicines WHERE id = $1 FOR UPDATE', [item.medicine_id]);
+        const med = medRes.rows[0];
         if (!med) {
           throw new Error(`Medicine ID ${item.medicine_id} not found`);
         }
@@ -70,29 +74,29 @@ router.post('/', upload.single('prescription_file'), validatePrescription, (req,
       }
 
       // 2. Insert order
-      result = db.prepare(
-        'INSERT INTO prescriptions (user_id, customer_name, customer_phone, file_path, original_filename, notes, status) VALUES (?, ?, ?, ?, ?, ?, ?)'
-      ).run(userId, customer_name, customer_phone, filePath, originalFilename, notes || null, parsedItems.length > 0 ? 'Checking Medicines' : 'Received');
+      const orderRes = await client.query(
+        'INSERT INTO prescriptions (user_id, customer_name, customer_phone, file_path, original_filename, notes, status) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
+        [userId, customer_name, customer_phone, filePath, originalFilename, notes || null, parsedItems.length > 0 ? 'Checking Medicines' : 'Received']
+      );
+      prescriptionId = orderRes.rows[0].id;
 
       // 3. Insert items and reduce stock
-      const insertItem = db.prepare('INSERT INTO order_items (prescription_id, medicine_id, quantity, price) VALUES (?, ?, ?, ?)');
-      const reduceStock = db.prepare("UPDATE medicines SET stock = stock - ?, updated_at = datetime('now') WHERE id = ?");
-      
       for (const item of parsedItems) {
-        insertItem.run(result.lastInsertRowid, item.medicine_id, item.quantity, item.price);
-        reduceStock.run(item.quantity, item.medicine_id);
+        await client.query('INSERT INTO order_items (prescription_id, medicine_id, quantity, price) VALUES ($1, $2, $3, $4)', [prescriptionId, item.medicine_id, item.quantity, item.price]);
+        await client.query("UPDATE medicines SET stock = stock - $1, updated_at = NOW() WHERE id = $2", [item.quantity, item.medicine_id]);
       }
-    });
-
-    try {
-      createOrder();
+      
+      await client.query('COMMIT');
     } catch (txError) {
+      await client.query('ROLLBACK');
       return res.status(400).json({ success: false, error: txError.message });
+    } finally {
+      client.release();
     }
 
-    const prescription = db.prepare('SELECT * FROM prescriptions WHERE id = ?').get(result.lastInsertRowid);
-    const orderItems = db.prepare('SELECT oi.*, m.name as medicine_name FROM order_items oi JOIN medicines m ON oi.medicine_id = m.id WHERE oi.prescription_id = ?').all(prescription.id);
-    res.status(201).json({ success: true, data: { ...prescription, items: orderItems } });
+    const prescriptionRes = await db.query('SELECT * FROM prescriptions WHERE id = $1', [prescriptionId]);
+    const orderItemsRes = await db.query('SELECT oi.*, m.name as medicine_name FROM order_items oi JOIN medicines m ON oi.medicine_id = m.id WHERE oi.prescription_id = $1', [prescriptionId]);
+    res.status(201).json({ success: true, data: { ...prescriptionRes.rows[0], items: orderItemsRes.rows } });
   } catch (err) {
     next(err);
   }
@@ -100,36 +104,40 @@ router.post('/', upload.single('prescription_file'), validatePrescription, (req,
 
 // GET /api/prescriptions — list prescriptions
 // Customers see only their own; owners see all
-router.get('/', (req, res, next) => {
+router.get('/', async (req, res, next) => {
   try {
     const { status, phone } = req.query;
     let sql = 'SELECT * FROM prescriptions WHERE 1=1';
     const params = [];
+    let paramIndex = 1;
 
     // Customers can only see their own prescriptions
     if (req.user && req.user.role === 'customer') {
-      sql += ' AND (user_id = ? OR customer_phone = ?)';
+      sql += ` AND (user_id = $${paramIndex} OR customer_phone = $${paramIndex + 1})`;
       params.push(req.user.id, req.user.phone);
+      paramIndex += 2;
     }
 
     if (status) {
-      sql += ' AND status = ?';
+      sql += ` AND status = $${paramIndex++}`;
       params.push(status);
     }
 
     if (phone && req.user?.role === 'owner') {
-      sql += ' AND customer_phone LIKE ?';
+      sql += ` AND customer_phone ILIKE $${paramIndex++}`;
       params.push(`%${phone}%`);
     }
 
     sql += ' ORDER BY created_at DESC';
 
-    const prescriptions = db.prepare(sql).all(...params);
+    const prescriptionsRes = await db.query(sql, params);
+    const prescriptions = prescriptionsRes.rows;
     
     // Attach order items
-    const stmtItems = db.prepare('SELECT oi.*, m.name as medicine_name FROM order_items oi JOIN medicines m ON oi.medicine_id = m.id WHERE oi.prescription_id = ?');
+    // Better handled in a single join query, but rewriting loops for direct migration
     for (const rx of prescriptions) {
-      rx.items = stmtItems.all(rx.id);
+      const itemsRes = await db.query('SELECT oi.*, m.name as medicine_name FROM order_items oi JOIN medicines m ON oi.medicine_id = m.id WHERE oi.prescription_id = $1', [rx.id]);
+      rx.items = itemsRes.rows;
     }
 
     res.json({ success: true, data: prescriptions });
@@ -139,9 +147,10 @@ router.get('/', (req, res, next) => {
 });
 
 // GET /api/prescriptions/:id
-router.get('/:id', (req, res, next) => {
+router.get('/:id', async (req, res, next) => {
   try {
-    const prescription = db.prepare('SELECT * FROM prescriptions WHERE id = ?').get(req.params.id);
+    const pRes = await db.query('SELECT * FROM prescriptions WHERE id = $1', [req.params.id]);
+    const prescription = pRes.rows[0];
     if (!prescription) {
       return res.status(404).json({ success: false, error: 'Prescription/Order not found' });
     }
@@ -151,7 +160,8 @@ router.get('/:id', (req, res, next) => {
       return res.status(403).json({ success: false, error: 'Access denied.' });
     }
 
-    prescription.items = db.prepare('SELECT oi.*, m.name as medicine_name FROM order_items oi JOIN medicines m ON oi.medicine_id = m.id WHERE oi.prescription_id = ?').all(prescription.id);
+    const itemsRes = await db.query('SELECT oi.*, m.name as medicine_name FROM order_items oi JOIN medicines m ON oi.medicine_id = m.id WHERE oi.prescription_id = $1', [prescription.id]);
+    prescription.items = itemsRes.rows;
     res.json({ success: true, data: prescription });
   } catch (err) {
     next(err);
@@ -159,10 +169,11 @@ router.get('/:id', (req, res, next) => {
 });
 
 // PATCH /api/prescriptions/:id/status — update prescription status (OWNER ONLY)
-router.patch('/:id/status', requireOwner, validateStatusUpdate, (req, res, next) => {
+router.patch('/:id/status', requireOwner, validateStatusUpdate, async (req, res, next) => {
   try {
     const { status, expected_date } = req.body;
-    const existing = db.prepare('SELECT * FROM prescriptions WHERE id = ?').get(req.params.id);
+    const existingRes = await db.query('SELECT * FROM prescriptions WHERE id = $1', [req.params.id]);
+    const existing = existingRes.rows[0];
 
     if (!existing) {
       return res.status(404).json({ success: false, error: 'Prescription/Order not found' });
@@ -184,16 +195,19 @@ router.patch('/:id/status', requireOwner, validateStatusUpdate, (req, res, next)
       });
     }
 
-    db.prepare(`
+    await db.query(`
       UPDATE prescriptions 
-      SET status = ?, 
-          expected_date = COALESCE(?, expected_date),
-          updated_at = datetime('now')
-      WHERE id = ?
-    `).run(status, expected_date || null, req.params.id);
+      SET status = $1, 
+          expected_date = COALESCE($2, expected_date),
+          updated_at = NOW()
+      WHERE id = $3
+    `, [status, expected_date || null, req.params.id]);
 
-    const updated = db.prepare('SELECT * FROM prescriptions WHERE id = ?').get(req.params.id);
-    updated.items = db.prepare('SELECT oi.*, m.name as medicine_name FROM order_items oi JOIN medicines m ON oi.medicine_id = m.id WHERE oi.prescription_id = ?').all(updated.id);
+    const updatedRes = await db.query('SELECT * FROM prescriptions WHERE id = $1', [req.params.id]);
+    const updated = updatedRes.rows[0];
+    const itemsRes = await db.query('SELECT oi.*, m.name as medicine_name FROM order_items oi JOIN medicines m ON oi.medicine_id = m.id WHERE oi.prescription_id = $1', [updated.id]);
+    updated.items = itemsRes.rows;
+    
     res.json({ success: true, data: updated });
   } catch (err) {
     next(err);
@@ -201,10 +215,10 @@ router.patch('/:id/status', requireOwner, validateStatusUpdate, (req, res, next)
 });
 
 // DELETE /api/prescriptions/:id (OWNER ONLY)
-router.delete('/:id', requireOwner, (req, res, next) => {
+router.delete('/:id', requireOwner, async (req, res, next) => {
   try {
-    const result = db.prepare('DELETE FROM prescriptions WHERE id = ?').run(req.params.id);
-    if (result.changes === 0) {
+    const result = await db.query('DELETE FROM prescriptions WHERE id = $1', [req.params.id]);
+    if (result.rowCount === 0) {
       return res.status(404).json({ success: false, error: 'Prescription not found' });
     }
     res.json({ success: true, message: 'Prescription deleted' });
