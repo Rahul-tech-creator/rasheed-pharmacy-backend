@@ -34,11 +34,11 @@ app.use(express.urlencoded({ extended: true }));
 // Serve uploaded files statically
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// API Routes
-app.use('/api/auth', authRouter);
-app.use('/api/medicines', medicinesRouter);
-app.use('/api/prescriptions', authenticate, prescriptionsRouter);
-app.use('/api/slots', authenticate, slotsRouter);
+// API Routes - Supporting both /api prefixed and non-prefixed for production resilience
+app.use(['/api/auth', '/auth'], authRouter);
+app.use(['/api/medicines', '/medicines'], medicinesRouter);
+app.use(['/api/prescriptions', '/prescriptions'], authenticate, prescriptionsRouter);
+app.use(['/api/slots', '/slots'], authenticate, slotsRouter);
 
 // Root route
 app.get('/', (req, res) => {
