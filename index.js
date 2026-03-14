@@ -59,7 +59,12 @@ app.get('/', (req, res) => {
 
 // Health check
 app.get('/api/health', (req, res) => {
-  res.json({ success: true, status: 'Rasheed Pharmacy API is running', timestamp: new Date().toISOString() });
+  res.json({ 
+    success: true, 
+    status: 'Rasheed Pharmacy API is running', 
+    timestamp: new Date().toISOString(),
+    env: process.env.NODE_ENV || 'development'
+  });
 });
 
 // 404 handler - catch all
